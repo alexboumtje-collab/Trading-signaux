@@ -4,6 +4,8 @@ Stratégie : confluence d'indicateurs (EMA, RSI, MACD, Supertrend, Bollinger)
 ⚠️ Outil pédagogique : ne constitue pas un conseil en investissement.
 """
 
+import itertools
+
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
@@ -89,6 +91,8 @@ RISK_PROFILES = {
 
 st.title("📈 Signaux Trading")
 
+# unité de temps supérieure utilisée pour le filtre de tendance
+HTF_RULE = {"5 min": "1h", "15 min": "1h", "1 heure": "4h", "4 heures": "1D", "1 jour": "1W"}
 CCXT_TF = {"5 min": "5m", "15 min": "15m", "1 heure": "1h", "4 heures": "4h", "1 jour": "1d"}
 CCXT_PAIRS = ["BTC/USDT", "ETH/USDT", "SOL/USDT", "XRP/USDT", "DOGE/USDT", "ADA/USDT",
               "Autre (saisie libre)"]
@@ -118,6 +122,12 @@ with st.expander("⚙️ Paramètres", expanded=True):
     sl_method = st.radio(
         "Stop-Loss basé sur", ["Swing Low/High", "ATR"], horizontal=True
     )
+    min_stop = st.slider("Stop minimum (× ATR)", 0.5, 4.0, 1.5, step=0.25,
+                         help="Distance minimale entre l'entrée et le Stop-Loss. Un stop trop "
+                              "serré se fait toucher par le bruit et les frais l'écrasent.")
+    use_htf = st.checkbox("Filtre de tendance (unité de temps supérieure)", value=True,
+                          help="N'autorise un achat que si la tendance de fond est haussière, "
+                               "une vente que si elle est baissière.")
     n_bars = st.slider("Bougies affichées", 60, 300, 120, step=10)
     c3, c4 = st.columns(2)
     capital = c3.number_input("Capital ($)", min_value=0.0, value=1000.0, step=100.0)
@@ -209,7 +219,7 @@ def supertrend(df, period=10, factor=3.0):
     return pd.Series(line, df.index), pd.Series(direction, df.index)
 
 
-def add_indicators(df):
+def add_indicators(df, htf_rule):
     df = df.copy()
     c = df["Close"]
     df["EMA20"], df["EMA50"], df["EMA200"] = ema(c, 20), ema(c, 50), ema(c, 200)
@@ -223,12 +233,23 @@ def add_indicators(df):
     df["BB_MID"], df["BB_UP"], df["BB_LOW"] = mid, mid + 2 * sd, mid - 2 * sd
     df["ATR"] = atr(df, 10)
     df["ST"], df["ST_DIR"] = supertrend(df, 10, 3.0)
+    # tendance de l'unité supérieure, décalée d'une barre (bougie supérieure déjà clôturée)
+    htf = df["Close"].resample(htf_rule).last().dropna()
+    f20 = htf.ewm(span=20, adjust=False, min_periods=20).mean()
+    f50 = htf.ewm(span=50, adjust=False, min_periods=50).mean()
+    trend = pd.Series(np.where(f20 > f50, 1.0, np.where(f20 < f50, -1.0, 0.0)),
+                      index=htf.index).shift(1)
+    df["HTF"] = trend.reindex(df.index, method="ffill").fillna(0.0)
     return df
 
 
 # ----------------------------------------------------------------------------
 # STRATÉGIE : CONFLUENCE
 # ----------------------------------------------------------------------------
+def htf_label(v):
+    return "haussière ↑" if v == 1 else "baissière ↓" if v == -1 else "neutre →"
+
+
 def evaluate(df):
     r, p = df.iloc[-1], df.iloc[-2]
     buy = {
@@ -255,30 +276,39 @@ def evaluate(df):
     sell = {k: bool(v) for k, v in sell.items()}
     nb, ns = sum(buy.values()), sum(sell.values())
 
-    side = None
+    cand = None
     if nb >= min_conf and nb > ns:
-        side = "BUY"
+        cand = "BUY"
     elif ns >= min_conf and ns > nb:
-        side = "SELL"
-    return side, buy, sell, nb, ns
+        cand = "SELL"
+    blocked = False
+    if cand and use_htf and ((cand == "BUY" and r.HTF != 1) or (cand == "SELL" and r.HTF != -1)):
+        cand, blocked = None, True
+    return cand, buy, sell, nb, ns, blocked
+
+
+def calc_sl(side, entry, a, swing, use_swing, mult, mstop):
+    """Stop-Loss : swing (si cohérent) sinon ATR, jamais plus proche que mstop × ATR."""
+    if side == 1:
+        sl_sw = swing - 0.1 * a
+        sl = sl_sw if (use_swing and 0.5 * a <= entry - sl_sw <= 3.5 * a) else entry - mult * a
+        return min(sl, entry - mstop * a)
+    sl_sw = swing + 0.1 * a
+    sl = sl_sw if (use_swing and 0.5 * a <= sl_sw - entry <= 3.5 * a) else entry + mult * a
+    return max(sl, entry + mstop * a)
 
 
 def compute_levels(df, side):
     r = df.iloc[-1]
     entry, a = float(r.Close), float(r.ATR)
     recent = df.tail(10)
+    use_sw = sl_method.startswith("Swing")
     if side == "BUY":
-        sl_atr = entry - sl_mult * a
-        sl_sw = float(recent["Low"].min()) - 0.1 * a
-        dist_sw = entry - sl_sw
-        sl = sl_sw if (sl_method.startswith("Swing") and 0.5 * a <= dist_sw <= 3.5 * a) else sl_atr
+        sl = calc_sl(1, entry, a, float(recent["Low"].min()), use_sw, sl_mult, min_stop)
         risk = entry - sl
         tp1, tp2 = entry + rr1 * risk, entry + rr2 * risk
     else:
-        sl_atr = entry + sl_mult * a
-        sl_sw = float(recent["High"].max()) + 0.1 * a
-        dist_sw = sl_sw - entry
-        sl = sl_sw if (sl_method.startswith("Swing") and 0.5 * a <= dist_sw <= 3.5 * a) else sl_atr
+        sl = calc_sl(-1, entry, a, float(recent["High"].max()), use_sw, sl_mult, min_stop)
         risk = sl - entry
         tp1, tp2 = entry - rr1 * risk, entry - rr2 * risk
     return entry, sl, tp1, tp2, risk
@@ -379,13 +409,13 @@ if raw.empty or len(raw) < 60:
                "(Yahoo : BTC-USD · ccxt : BTC/USDT), changez d'exchange ou réessayez plus tard.")
     st.stop()
 
-df = add_indicators(raw).dropna(subset=["EMA50", "RSI", "BB_UP", "ATR", "MACD_SIG"])
+df = add_indicators(raw, HTF_RULE[tf_label]).dropna(subset=["EMA50", "RSI", "BB_UP", "ATR", "MACD_SIG"])
 if len(df) < 5:
     st.warning("Pas assez de bougies pour calculer les indicateurs.")
     st.stop()
 
 last = df.iloc[-1]
-side, buy_c, sell_c, nb, ns = evaluate(df)
+side, buy_c, sell_c, nb, ns, blocked = evaluate(df)
 chg = (df.Close.iloc[-1] / df.Close.iloc[-2] - 1) * 100
 st.caption(
     f"**{ticker}** · {tf_label} · Dernier prix : **{fmt(last.Close)}** "
@@ -400,7 +430,7 @@ if side:
     st.markdown(
         f"""<div class="sig-card {'sig-buy' if is_buy else 'sig-sell'}">
 <div class="sig-title">{'🟢 ACHAT' if is_buy else '🔴 VENTE'}</div>
-<div class="sig-sub">Confluence : {nb if is_buy else ns}/5 conditions · Profil {risk_label}</div>
+<div class="sig-sub">Confluence : {nb if is_buy else ns}/5 · Profil {risk_label}<br>Tendance supérieure : {htf_label(last.HTF)}</div>
 </div>""",
         unsafe_allow_html=True,
     )
@@ -421,18 +451,20 @@ if side:
     )
     valid = [k for k, v in (buy_c if is_buy else sell_c).items() if v]
     why = "<br>".join(f"✅ {v}" for v in valid)
-    sl_src = "ATR" if abs(abs(entry - sl) - sl_mult * last.ATR) < 1e-9 else "dernier swing"
+    sl_txt = f"{risk / last.ATR:.1f}× l'ATR de l'entrée"
     st.markdown(
         f"""<div class="why"><b>Pourquoi ce signal ?</b><br>{why}<br>
-<b>Gestion :</b> SL placé via {sl_src} ; TP1 = {rr1:g}× le risque, TP2 = {rr2:g}×.
+<b>Gestion :</b> SL placé à {sl_txt} ; TP1 = {rr1:g}× le risque, TP2 = {rr2:g}×.
 Sécurisez une partie au TP1 et passez le SL à l'entrée.</div>""",
         unsafe_allow_html=True,
     )
 else:
+    wait_msg = ("Signal bloqué : il va contre la tendance de l'unité supérieure" if blocked
+                else f"Aucune confluence suffisante (minimum {min_conf}/5 requis)")
     st.markdown(
         f"""<div class="sig-card sig-wait">
 <div class="sig-title">⏸ ATTENTE</div>
-<div class="sig-sub">Aucune confluence suffisante (minimum {min_conf}/5 requis)</div>
+<div class="sig-sub">{wait_msg}</div>
 </div>""",
         unsafe_allow_html=True,
     )
@@ -443,6 +475,8 @@ else:
     )
 
 with st.expander("🔍 Détail des conditions"):
+    st.write(f"Tendance de l'unité supérieure : **{htf_label(last.HTF)}**"
+             + (" (filtre actif)" if use_htf else " (filtre désactivé)"))
     st.markdown("**Achat**")
     for k, v in buy_c.items():
         st.write(("✅ " if v else "⬜ ") + k)
@@ -478,38 +512,42 @@ def score_series(d):
     return buy.to_numpy(), sell.to_numpy()
 
 
-def run_backtest(d, target_rr, max_hold, fee_pct):
+def prepare_bt(d):
+    b, s = score_series(d)
+    return {
+        "b": b, "s": s, "htf": d.HTF.to_numpy(), "index": d.index,
+        "close": d.Close.to_numpy(), "high": d.High.to_numpy(), "low": d.Low.to_numpy(),
+        "atr": d.ATR.to_numpy(),
+        "sw_low": d.Low.rolling(10).min().to_numpy(),
+        "sw_high": d.High.rolling(10).max().to_numpy(),
+    }
+
+
+def run_backtest(P, start, end, conf, mult, use_swing, mstop, htf_on, target_rr, max_hold, fee_pct):
     """Un seul trade à la fois. Sortie au SL, à la cible, ou à la clôture après max_hold.
     Si SL et cible sont touchés dans la même bougie, le SL est retenu (hypothèse prudente)."""
-    b, s = score_series(d)
-    close, high, low = d.Close.to_numpy(), d.High.to_numpy(), d.Low.to_numpy()
-    a = d.ATR.to_numpy()
-    sw_low = d.Low.rolling(10).min().to_numpy()
-    sw_high = d.High.rolling(10).max().to_numpy()
-    use_swing = sl_method.startswith("Swing")
-    n = len(d)
-    i = min(100, n // 3)  # période de chauffe des indicateurs
+    b, s, htf = P["b"], P["s"], P["htf"]
+    close, high, low, a = P["close"], P["high"], P["low"], P["atr"]
     trades = []
-    while i < n - 1:
-        side = 1 if (b[i] >= min_conf and b[i] > s[i]) else -1 if (s[i] >= min_conf and s[i] > b[i]) else 0
+    i = start
+    while i < end - 1:
+        side = 1 if (b[i] >= conf and b[i] > s[i]) else -1 if (s[i] >= conf and s[i] > b[i]) else 0
+        if side != 0 and htf_on and htf[i] != side:
+            side = 0
         if side == 0 or np.isnan(a[i]):
             i += 1
             continue
-        entry, atr_i = close[i], a[i]
-        if side == 1:
-            sl_sw, sl_at = sw_low[i] - 0.1 * atr_i, entry - sl_mult * atr_i
-            sl = sl_sw if (use_swing and 0.5 * atr_i <= entry - sl_sw <= 3.5 * atr_i) else sl_at
-        else:
-            sl_sw, sl_at = sw_high[i] + 0.1 * atr_i, entry + sl_mult * atr_i
-            sl = sl_sw if (use_swing and 0.5 * atr_i <= sl_sw - entry <= 3.5 * atr_i) else sl_at
+        entry = close[i]
+        sl = calc_sl(side, entry, a[i], P["sw_low"][i] if side == 1 else P["sw_high"][i],
+                     use_swing, mult, mstop)
         risk = abs(entry - sl)
         if risk <= 0:
             i += 1
             continue
         tp = entry + side * target_rr * risk
-        end = min(i + max_hold, n - 1)
-        exit_j, r_mult, why = end, side * (close[end] - entry) / risk, "Temps"
-        for j in range(i + 1, end + 1):
+        last_bar = min(i + max_hold, end - 1)
+        exit_j, r_mult, why = last_bar, side * (close[last_bar] - entry) / risk, "Temps"
+        for j in range(i + 1, last_bar + 1):
             hit_sl = low[j] <= sl if side == 1 else high[j] >= sl
             hit_tp = high[j] >= tp if side == 1 else low[j] <= tp
             if hit_sl:
@@ -519,43 +557,59 @@ def run_backtest(d, target_rr, max_hold, fee_pct):
                 exit_j, r_mult, why = j, float(target_rr), "TP"
                 break
         r_net = r_mult - (fee_pct / 100 * entry / risk)
-        trades.append({"Date": d.index[i], "Sens": "ACHAT" if side == 1 else "VENTE",
+        trades.append({"Date": P["index"][i], "Sens": "ACHAT" if side == 1 else "VENTE",
                        "Sortie": why, "R net": round(float(r_net), 2)})
         i = exit_j + 1
     return pd.DataFrame(trades)
 
 
+def summarize(tr):
+    if tr is None or tr.empty:
+        return {"n": 0, "win": 0.0, "exp": 0.0, "pf": 0.0, "total": 0.0, "dd": 0.0}
+    r = tr["R net"].to_numpy()
+    gains, pertes = r[r > 0].sum(), -r[r <= 0].sum()
+    eq = np.concatenate([[0.0], np.cumsum(r)])
+    return {"n": len(r), "win": (r > 0).mean() * 100, "exp": r.mean(),
+            "pf": gains / pertes if pertes > 0 else float("inf"),
+            "total": r.sum(), "dd": (np.maximum.accumulate(eq) - eq).max()}
+
+
+def fmt_pf(x):
+    return "∞" if x == float("inf") else f"{x:.2f}"
+
+
 with st.expander("🧪 Backtest de la stratégie"):
-    st.caption("Rejoue les règles de confluence sur l'historique chargé ci-dessus. "
+    st.caption("Rejoue les règles de confluence sur l'historique chargé ci-dessus, avec "
+               "vos réglages (profil, Stop-Loss, stop minimum, filtre de tendance). "
                "Résultats en multiples de R (1R = risque pris sur le trade).")
     bc1, bc2 = st.columns(2)
     target_name = bc1.selectbox("Objectif de sortie", ["TP1", "TP2"])
     fee = bc2.number_input("Frais A/R (%)", 0.0, 2.0, 0.1, step=0.05)
     hold = st.slider("Durée max d'un trade (bougies)", 10, 200, 50)
     if st.button("▶️ Lancer le backtest", width="stretch"):
-        tr = run_backtest(df, rr1 if target_name == "TP1" else rr2, hold, fee)
+        tgt = rr1 if target_name == "TP1" else rr2
+        P = prepare_bt(df)
+        start = min(100, len(df) // 3)
+        tr = run_backtest(P, start, len(df), min_conf, sl_mult, sl_method.startswith("Swing"),
+                          min_stop, use_htf, tgt, hold, fee)
         if tr.empty:
             st.info("Aucun trade déclenché sur cette période avec ces réglages.")
         else:
-            r = tr["R net"]
-            wins, losses = r[r > 0], r[r <= 0]
-            pf = wins.sum() / abs(losses.sum()) if losses.sum() != 0 else float("inf")
-            equity = r.cumsum()
-            max_dd = (equity.cummax() - equity).max()
-            tgt = rr1 if target_name == "TP1" else rr2
+            m = summarize(tr)
+            equity = tr["R net"].cumsum()
             st.markdown(
                 f"""<div class="grid">
-<div class="cell c-entry"><div class="lbl">Trades</div><div class="val">{len(tr)}</div></div>
-<div class="cell c-tp"><div class="lbl">Taux de réussite</div><div class="val">{(r > 0).mean() * 100:.0f}%</div></div>
-<div class="cell c-rr"><div class="lbl">Espérance / trade</div><div class="val">{r.mean():+.2f} R</div></div>
-<div class="cell c-rr"><div class="lbl">Profit factor</div><div class="val">{'∞' if pf == float('inf') else f'{pf:.2f}'}</div></div>
-<div class="cell c-tp"><div class="lbl">Résultat total</div><div class="val">{r.sum():+.1f} R</div></div>
-<div class="cell c-sl"><div class="lbl">Drawdown max</div><div class="val">-{max_dd:.1f} R</div></div>
+<div class="cell c-entry"><div class="lbl">Trades</div><div class="val">{m['n']}</div></div>
+<div class="cell c-tp"><div class="lbl">Taux de réussite</div><div class="val">{m['win']:.0f}%</div></div>
+<div class="cell c-rr"><div class="lbl">Espérance / trade</div><div class="val">{m['exp']:+.2f} R</div></div>
+<div class="cell c-rr"><div class="lbl">Profit factor</div><div class="val">{fmt_pf(m['pf'])}</div></div>
+<div class="cell c-tp"><div class="lbl">Résultat total</div><div class="val">{m['total']:+.1f} R</div></div>
+<div class="cell c-sl"><div class="lbl">Drawdown max</div><div class="val">-{m['dd']:.1f} R</div></div>
 </div>""",
                 unsafe_allow_html=True,
             )
             st.caption(f"Pour 1:{tgt:g}, le seuil de rentabilité est ≈ {100 / (1 + tgt):.0f}% de réussite "
-                       f"(avant frais). Période testée : {df.index[min(100, len(df) // 3)].strftime('%d/%m/%y')} "
+                       f"(avant frais). Période testée : {df.index[start].strftime('%d/%m/%y')} "
                        f"→ {df.index[-1].strftime('%d/%m/%y')}.")
             fig_eq = go.Figure(go.Scatter(x=list(range(1, len(equity) + 1)), y=equity,
                                           mode="lines", line=dict(color="#42a5f5", width=2),
@@ -570,8 +624,57 @@ with st.expander("🧪 Backtest de la stratégie"):
             show = tr.tail(15).copy()
             show["Date"] = show["Date"].dt.strftime("%d/%m %H:%M")
             st.dataframe(show.iloc[::-1], width="stretch", hide_index=True)
-            st.caption("⚠️ Test sur historique (in-sample), sans slippage : un bon résultat passé "
+            st.caption("⚠️ Test sur historique, sans slippage : un bon résultat passé "
                        "ne garantit rien. Peu de trades = résultat peu fiable.")
+
+with st.expander("🔬 Trouver le meilleur réglage"):
+    st.caption("Teste 64 combinaisons sur les **70 % premiers** de l'historique, puis vérifie "
+               "les 5 meilleures sur les **30 % restants**, que la recherche n'a jamais vus. "
+               "C'est le test anti-« sur-ajustement » : un réglage n'est crédible que s'il "
+               "gagne aussi sur ces données-là.")
+    min_tr = st.slider("Trades minimum (partie 70 %)", 10, 60, 20)
+    if st.button("🚀 Lancer la recherche", width="stretch"):
+        P = prepare_bt(df)
+        n = len(df)
+        start = min(100, n // 3)
+        cut = start + int((n - start) * 0.7)
+        rows = []
+        for conf, use_sw, ms, rr, htf_on in itertools.product(
+                [3, 4], [True, False], [1.0, 1.5, 2.0, 3.0], [2.0, 3.0], [True, False]):
+            trn = summarize(run_backtest(P, start, cut, conf, sl_mult, use_sw, ms, htf_on,
+                                         rr, hold, fee))
+            if trn["n"] >= min_tr:
+                rows.append((conf, use_sw, ms, rr, htf_on, trn))
+        if not rows:
+            st.info("Pas assez de trades pour comparer : baissez le minimum de trades ou "
+                    "choisissez une unité de temps plus courte.")
+        else:
+            rows.sort(key=lambda x: x[5]["exp"], reverse=True)
+            ok = 0
+            for k, (conf, use_sw, ms, rr, htf_on, trn) in enumerate(rows[:5], 1):
+                tst = summarize(run_backtest(P, cut, n, conf, sl_mult, use_sw, ms, htf_on,
+                                             rr, hold, fee))
+                if tst["n"] < 8:
+                    verdict = "❓ Trop peu de trades en test"
+                elif tst["exp"] > 0 and tst["pf"] >= 1.2:
+                    verdict, ok = "✅ Résiste au test", ok + 1
+                else:
+                    verdict = "❌ Ne résiste pas au test"
+                st.markdown(
+                    f"""<div class="why"><b>#{k} · {verdict}</b><br>
+Profil {'Prudent' if conf == 4 else 'Équilibré'} · SL {'Swing' if use_sw else 'ATR'} · Stop min {ms:g}×ATR · Cible 1:{rr:g} · Filtre tendance {'oui' if htf_on else 'non'}<br>
+Apprentissage : {trn['n']} trades · {trn['exp']:+.2f} R/trade<br>
+<b>Test (jamais vu)</b> : {tst['n']} trades · {tst['exp']:+.2f} R/trade · PF {fmt_pf(tst['pf'])}</div>""",
+                    unsafe_allow_html=True,
+                )
+                st.write("")
+            if ok == 0:
+                st.warning("Aucun réglage ne tient sur les données non vues. Ne tradez pas cette "
+                           "configuration : essayez un autre actif ou une autre unité de temps.")
+            else:
+                st.success(f"{ok} réglage(s) sur 5 résistent. Recopiez-les dans ⚙️ Paramètres "
+                           "(profil, Stop-Loss, stop minimum, filtre), relancez le backtest "
+                           "complet, puis confirmez en démo. Un seul test réussi ne prouve rien.")
 
 st.markdown(
     '<div class="warn">⚠️ Outil éducatif, sans garantie de résultat. Aucun signal '
